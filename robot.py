@@ -1,4 +1,5 @@
 import os
+import csv
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -30,6 +31,8 @@ class CodespaceSelfImprovingRobot:
         self.bot_traded_symbols = set()
         self.active_trade_symbols = set()
         self.active_trade_pnl_baselines = {}
+        self.trade_audit_filename = "trade_audit_log.csv"
+        self.open_trade_audit = {}
         self._entry_in_progress = False
 
         self.start_capital = 200000.00
@@ -425,6 +428,147 @@ class CodespaceSelfImprovingRobot:
             self.active_trade_symbols.add(symbol)
         return order_id
 
+    def _order_details(self, order_id):
+        orders = self._kite_read("orders")
+        return next(
+            (order for order in orders if str(order.get("order_id")) == str(order_id)),
+            None,
+        )
+
+    def _write_trade_audit(
+        self,
+        symbol,
+        side,
+        quantity,
+        trigger_price,
+        fill_price,
+        exit_reason="",
+        gross_pnl=None,
+    ):
+        slippage_points = (
+            fill_price - trigger_price
+            if side == self.kite.TRANSACTION_TYPE_BUY
+            else trigger_price - fill_price
+        )
+        file_exists = os.path.exists(self.trade_audit_filename)
+        with open(self.trade_audit_filename, "a", newline="") as audit_file:
+            writer = csv.DictWriter(
+                audit_file,
+                fieldnames=[
+                    "timestamp_ist",
+                    "symbol",
+                    "side",
+                    "qty",
+                    "trigger_signal_price",
+                    "average_fill_price",
+                    "slippage_points",
+                    "slippage_rupees",
+                    "exit_reason",
+                    "gross_pnl",
+                ],
+            )
+            if not file_exists or os.path.getsize(self.trade_audit_filename) == 0:
+                writer.writeheader()
+            writer.writerow(
+                {
+                    "timestamp_ist": datetime.now(
+                        ZoneInfo("Asia/Kolkata")
+                    ).isoformat(),
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": quantity,
+                    "trigger_signal_price": f"{trigger_price:.2f}",
+                    "average_fill_price": f"{fill_price:.2f}",
+                    "slippage_points": f"{slippage_points:.2f}",
+                    "slippage_rupees": f"{slippage_points * quantity:.2f}",
+                    "exit_reason": exit_reason,
+                    "gross_pnl": "" if gross_pnl is None else f"{gross_pnl:.2f}",
+                }
+            )
+
+    def _audit_filled_order(
+        self,
+        order_id,
+        symbol,
+        side,
+        requested_quantity,
+        trigger_price,
+        is_entry,
+        exit_reason="",
+        fallback_entry=None,
+    ):
+        order = self._order_details(order_id)
+        if not order:
+            raise RuntimeError(f"Order {order_id} was not found in Kite orders.")
+        filled_quantity = int(order.get("filled_quantity") or 0)
+        fill_price = float(order.get("average_price") or 0.0)
+        if filled_quantity <= 0 or fill_price <= 0:
+            return 0
+
+        quantity = min(filled_quantity, requested_quantity)
+        gross_pnl = None
+        if is_entry:
+            previous = self.open_trade_audit.get(symbol)
+            if previous:
+                combined_qty = previous["quantity"] + quantity
+                previous["entry_price"] = (
+                    previous["entry_price"] * previous["quantity"]
+                    + fill_price * quantity
+                ) / combined_qty
+                previous["quantity"] = combined_qty
+            else:
+                self.open_trade_audit[symbol] = {
+                    "side": side,
+                    "entry_price": fill_price,
+                    "quantity": quantity,
+                }
+        else:
+            entry = self.open_trade_audit.get(symbol) or fallback_entry
+            if entry:
+                matched_quantity = min(quantity, entry["quantity"])
+                price_change = (
+                    fill_price - entry["entry_price"]
+                    if entry["side"] == self.kite.TRANSACTION_TYPE_BUY
+                    else entry["entry_price"] - fill_price
+                )
+                gross_pnl = price_change * matched_quantity
+                remaining = entry["quantity"] - matched_quantity
+                if remaining > 0 and symbol in self.open_trade_audit:
+                    self.open_trade_audit[symbol]["quantity"] = remaining
+                else:
+                    self.open_trade_audit.pop(symbol, None)
+
+        self._write_trade_audit(
+            symbol,
+            side,
+            quantity,
+            trigger_price,
+            fill_price,
+            exit_reason=exit_reason,
+            gross_pnl=gross_pnl,
+        )
+        return quantity
+
+    def _submit_audited_entry(self, index_name, contract, side):
+        quantity = self.execution_quantities[index_name]
+        order_id = self._place_option_order(index_name, contract, side)
+        if not self._wait_for_fill(order_id):
+            try:
+                self.kite.cancel_order(
+                    variety=self.kite.VARIETY_REGULAR, order_id=order_id
+                )
+            except Exception:
+                pass
+        filled_quantity = self._audit_filled_order(
+            order_id,
+            contract["tradingsymbol"],
+            side,
+            quantity,
+            float(contract["last_price"]),
+            is_entry=True,
+        )
+        return order_id, filled_quantity
+
     def _wait_for_fill(self, order_id, timeout=10):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -447,9 +591,11 @@ class CodespaceSelfImprovingRobot:
             contract = self._find_contract(chain, candidate["option_type"], atm)
             if not contract or contract["last_price"] <= 0:
                 return False
-            order_id = self._place_option_order(name, contract, self.kite.TRANSACTION_TYPE_BUY)
+            order_id, filled_quantity = self._submit_audited_entry(
+                name, contract, self.kite.TRANSACTION_TYPE_BUY
+            )
             print(f"[ORDER] {name} BUY {contract['tradingsymbol']} x{quantity}; order {order_id}")
-            return True
+            return filled_quantity > 0
 
         if candidate["mode"] == "PUT_CREDIT":
             short_contract = chain["support"]
@@ -471,26 +617,20 @@ class CodespaceSelfImprovingRobot:
         ):
             return False
 
-        protective_order = self._place_option_order(
+        protective_order, protective_filled = self._submit_audited_entry(
             name, long_contract, self.kite.TRANSACTION_TYPE_BUY
         )
-        if not self._wait_for_fill(protective_order):
-            try:
-                self.kite.cancel_order(
-                    variety=self.kite.VARIETY_REGULAR, order_id=protective_order
-                )
-            except Exception:
-                pass
+        if protective_filled < quantity:
             print(f"[SPREAD ABORTED] {name} protective leg was not confirmed filled.")
+            if protective_filled:
+                self._square_off_mis_positions("PER_TRADE_SL")
             return False
 
         try:
             daily_pnl = self._get_session_pnl()
         except Exception as exc:
             try:
-                self._place_option_order(
-                    name, long_contract, self.kite.TRANSACTION_TYPE_SELL
-                )
+                self._square_off_mis_positions("PER_TRADE_SL")
             except Exception as cleanup_exc:
                 raise RuntimeError(
                     "Could not verify session P&L or close the protective spread leg."
@@ -502,12 +642,16 @@ class CodespaceSelfImprovingRobot:
             return False
 
         try:
-            short_order = self._place_option_order(
+            short_order, short_filled = self._submit_audited_entry(
                 name, short_contract, self.kite.TRANSACTION_TYPE_SELL
             )
         except Exception:
-            self._place_option_order(name, long_contract, self.kite.TRANSACTION_TYPE_SELL)
+            self._square_off_mis_positions("PER_TRADE_SL")
             raise
+        if short_filled < quantity:
+            print(f"[SPREAD ABORTED] {name} short leg was not confirmed filled.")
+            self._square_off_mis_positions("PER_TRADE_SL")
+            return False
         print(
             f"[SPREAD] {name} {candidate['mode']} x{quantity}; "
             f"protective order {protective_order}, short order {short_order}"
@@ -555,6 +699,57 @@ class CodespaceSelfImprovingRobot:
             if position.get("tradingsymbol") in self.active_trade_symbols
         )
 
+    def _get_live_bot_pnl(self):
+        positions = self._kite_read("positions")
+        open_positions = [
+            position
+            for position in positions.get("net", [])
+            if position.get("product") == self.kite.PRODUCT_MIS
+            and int(position.get("quantity") or 0) != 0
+            and position.get("tradingsymbol") in self.bot_traded_symbols
+        ]
+        quote_keys = {
+            f"{position['exchange']}:{position['tradingsymbol']}"
+            for position in open_positions
+        }
+        quotes = self._kite_read("ltp", *quote_keys) if quote_keys else {}
+        live_prices = {
+            f"{position['exchange']}:{position['tradingsymbol']}": float(
+                quotes[
+                    f"{position['exchange']}:{position['tradingsymbol']}"
+                ]["last_price"]
+            )
+            for position in open_positions
+        }
+        live_pnl_by_symbol = {}
+        for position in open_positions:
+            symbol = position["tradingsymbol"]
+            quote_key = f"{position['exchange']}:{symbol}"
+            live_pnl_by_symbol[symbol] = (
+                live_prices[quote_key] - float(position.get("average_price") or 0.0)
+            ) * int(position["quantity"])
+
+        daily_pnl = 0.0
+        trade_pnl = 0.0
+        for position in positions.get("day", []):
+            symbol = position.get("tradingsymbol")
+            if symbol not in self.bot_traded_symbols:
+                continue
+            unrealised = float(position.get("unrealised") or 0.0)
+            realised = position.get("realised")
+            if realised is None:
+                realised = self._position_pnl(position) - unrealised
+            realised = float(realised or 0.0)
+            live_unrealised = live_pnl_by_symbol.get(symbol, 0.0)
+            daily_pnl += realised + live_unrealised
+            if symbol in self.active_trade_symbols:
+                trade_pnl += (
+                    realised
+                    - self.active_trade_pnl_baselines.get(symbol, 0.0)
+                    + live_unrealised
+                )
+        return open_positions, live_prices, daily_pnl, trade_pnl
+
     def _get_open_bot_positions(self):
         if not self.bot_traded_symbols:
             return []
@@ -566,23 +761,67 @@ class CodespaceSelfImprovingRobot:
             and position.get("tradingsymbol") in self.bot_traded_symbols
         ]
 
-    def _manage_active_trade(self):
-        open_positions = self._get_open_bot_positions()
-        if not open_positions:
-            self.active_trade_symbols.clear()
-            self.active_trade_pnl_baselines.clear()
-            return False
+    def _manage_active_trade(self, ist=None):
+        ist = ist or ZoneInfo("Asia/Kolkata")
+        monitored = False
+        while True:
+            now_ist = datetime.now(ist)
+            market_close = now_ist.replace(hour=15, minute=15, second=0, microsecond=0)
+            if now_ist >= market_close:
+                try:
+                    self._square_off_mis_positions("EOD_SQUARE_OFF")
+                except Exception as exc:
+                    print(f"⚠️ EOD square-off failed; retrying shortly: {exc}")
+                    time.sleep(2)
+                    continue
+                return monitored
 
-        trade_pnl = self._get_active_trade_pnl()
-        print(f"[ACTIVE TRADE] P&L: ₹{trade_pnl:,.2f}")
-        if trade_pnl >= self.trade_target or trade_pnl <= -self.trade_max_loss:
-            reason = "target" if trade_pnl >= self.trade_target else "stop-loss"
-            print(f"[ACTIVE TRADE] {reason} reached; closing bot positions.")
-            self._square_off_mis_positions()
-            return True
-        return False
+            try:
+                open_positions, live_prices, daily_pnl, trade_pnl = (
+                    self._get_live_bot_pnl()
+                )
+            except Exception as exc:
+                print(f"⚠️ Active trade LTP/P&L check failed; retrying in 2 seconds: {exc}")
+                time.sleep(2)
+                continue
+            if not open_positions:
+                self.active_trade_symbols.clear()
+                self.active_trade_pnl_baselines.clear()
+                return monitored
 
-    def _square_off_mis_positions(self):
+            monitored = True
+            print(
+                f"[ACTIVE TRADE] P&L: ₹{trade_pnl:,.2f} | "
+                f"Session P&L: ₹{daily_pnl:,.2f}"
+            )
+            if daily_pnl >= self.daily_target:
+                reason = "DAILY_TARGET"
+            elif daily_pnl <= -self.daily_max_loss:
+                reason = "DAILY_SL"
+            elif trade_pnl >= self.trade_target:
+                reason = "PER_TRADE_TARGET"
+            elif trade_pnl <= -self.trade_max_loss:
+                reason = "PER_TRADE_SL"
+            else:
+                reason = None
+
+            if reason:
+                print(f"[ACTIVE TRADE] {reason} reached; closing bot positions.")
+                try:
+                    self._square_off_mis_positions(reason, live_prices)
+                except Exception as exc:
+                    print(f"⚠️ {reason} square-off failed; retrying shortly: {exc}")
+                    time.sleep(2)
+                else:
+                    time.sleep(2)
+                continue
+
+            time.sleep(min(2, max(0, (market_close - datetime.now(ist)).total_seconds())))
+
+    def _square_off_mis_positions(
+        self, exit_reason="EOD_SQUARE_OFF", live_prices=None
+    ):
+        live_prices = live_prices or {}
         if not self.bot_traded_symbols:
             print("[SQUARE-OFF] No bot-traded symbols to close.")
             return
@@ -618,6 +857,39 @@ class CodespaceSelfImprovingRobot:
                     order_type=self.kite.ORDER_TYPE_MARKET,
                     market_protection=-1,
                 )
+                if not self._wait_for_fill(order_id):
+                    try:
+                        self.kite.cancel_order(
+                            variety=self.kite.VARIETY_REGULAR, order_id=order_id
+                        )
+                    except Exception:
+                        pass
+                quote_key = f"{position['exchange']}:{position['tradingsymbol']}"
+                trigger_price = live_prices.get(
+                    quote_key, float(position.get("last_price") or 0.0)
+                )
+                filled_quantity = self._audit_filled_order(
+                    order_id,
+                    position["tradingsymbol"],
+                    transaction_type,
+                    abs(quantity),
+                    trigger_price,
+                    is_entry=False,
+                    exit_reason=exit_reason,
+                    fallback_entry={
+                        "side": (
+                            self.kite.TRANSACTION_TYPE_BUY
+                            if quantity > 0
+                            else self.kite.TRANSACTION_TYPE_SELL
+                        ),
+                        "entry_price": float(position.get("average_price") or 0.0),
+                        "quantity": abs(quantity),
+                    },
+                )
+                if filled_quantity == 0:
+                    raise RuntimeError(
+                        f"Square-off order {order_id} did not fill any quantity."
+                    )
                 print(
                     f"[SQUARE-OFF] {position['tradingsymbol']} "
                     f"{transaction_type} x{abs(quantity)}; order {order_id}"
@@ -634,12 +906,12 @@ class CodespaceSelfImprovingRobot:
         now_ist = datetime.now(ist)
         market_close = now_ist.replace(hour=15, minute=15, second=0, microsecond=0)
         if now_ist >= market_close:
-            self._square_off_bot_positions()
+            self._square_off_bot_positions("EOD_SQUARE_OFF")
 
-    def _square_off_bot_positions(self):
+    def _square_off_bot_positions(self, exit_reason="EOD_SQUARE_OFF"):
         for attempt in range(2):
             try:
-                self._square_off_mis_positions()
+                self._square_off_mis_positions(exit_reason)
                 return
             except KiteReadError as exc:
                 if attempt == 0:
@@ -656,6 +928,13 @@ class CodespaceSelfImprovingRobot:
             print(f"\n🛑 [CIRCUIT BREAKER] Daily loss ₹{abs(daily_pnl):,.2f}. Stopping for the day.")
             return True
         return False
+
+    def _daily_exit_reason(self, daily_pnl):
+        if daily_pnl >= self.daily_target:
+            return "DAILY_TARGET"
+        if daily_pnl <= -self.daily_max_loss:
+            return "DAILY_SL"
+        return "EOD_SQUARE_OFF"
         
     def run_self_analysis(self):
         print("🧠 [AI Core] Codespace analysis running on historical database logs...")
@@ -693,7 +972,7 @@ class CodespaceSelfImprovingRobot:
         try:
             self._run_live_cycle(cycles=cycles, poll_interval=poll_interval)
         finally:
-            self._square_off_bot_positions()
+            self._square_off_bot_positions("EOD_SQUARE_OFF")
 
     def _run_live_cycle(self, cycles=None, poll_interval=30):
         print("⚡ Live Kite session initiated. Scanning NIFTY, BANKNIFTY, and SENSEX...")
@@ -741,9 +1020,10 @@ class CodespaceSelfImprovingRobot:
             cycle += 1
             print(f"\n🔍 Cycle #{cycle} | Bot session P&L: ₹{daily_pnl:,.2f}")
             if self._check_circuit_breaker(daily_pnl):
+                self._square_off_bot_positions(self._daily_exit_reason(daily_pnl))
                 break
             try:
-                if self._manage_active_trade():
+                if self._manage_active_trade(ist):
                     if cycles is None or cycle < cycles:
                         time.sleep(poll_interval)
                     continue
@@ -848,7 +1128,9 @@ class CodespaceSelfImprovingRobot:
                     self._square_off_if_due(ist)
                     break
                 if self._check_circuit_breaker(daily_pnl):
-                    self._square_off_if_due(ist)
+                    self._square_off_bot_positions(
+                        self._daily_exit_reason(daily_pnl)
+                    )
                     return
                 order_time = datetime.now(ist)
                 order_cutoff = order_time.replace(
@@ -867,14 +1149,28 @@ class CodespaceSelfImprovingRobot:
                         self._entry_in_progress = False
                 except KiteReadError as exc:
                     print(f"⚠️ {name} scan paused; retrying next cycle: {exc}")
+                    try:
+                        self._manage_active_trade(ist)
+                    except Exception as monitor_exc:
+                        print(
+                            "⚠️ Could not manage a position after the order error: "
+                            f"{monitor_exc}"
+                        )
                     break
                 except Exception as exc:
                     print(f"⚠️ {name} order failed; continuing scan: {exc}")
+                    try:
+                        self._manage_active_trade(ist)
+                    except Exception as monitor_exc:
+                        print(
+                            "⚠️ Could not manage a position after the order error: "
+                            f"{monitor_exc}"
+                        )
                     continue
                 if submitted:
                     self.last_order_candle[name] = candidate["candle"]
                 try:
-                    if self._manage_active_trade():
+                    if self._manage_active_trade(ist):
                         break
                 except Exception as exc:
                     print(f"⚠️ Could not verify active trade P&L; retrying next cycle: {exc}")
@@ -886,7 +1182,9 @@ class CodespaceSelfImprovingRobot:
                     self._square_off_if_due(ist)
                     break
                 if self._check_circuit_breaker(daily_pnl):
-                    self._square_off_if_due(ist)
+                    self._square_off_bot_positions(
+                        self._daily_exit_reason(daily_pnl)
+                    )
                     return
                 if submitted:
                     break
