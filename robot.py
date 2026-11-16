@@ -1,13 +1,13 @@
 import os
 import csv
 from pathlib import Path
+from math import isfinite, log1p
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(".") / ".env")
 
 import time
 import json
-from math import log1p
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -26,14 +26,15 @@ class CodespaceSelfImprovingRobot:
         self.API_KEY = os.environ.get("KITE_API_KEY")
         self.API_SECRET = os.environ.get("KITE_API_SECRET")
         self.ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", "")
-        self.kite = KiteConnect(api_key=self.API_KEY, timeout=20)
-        self._authenticate()
-        self.bot_traded_symbols = set()
-        self.active_trade_symbols = set()
-        self.active_trade_pnl_baselines = {}
         self.trade_audit_filename = "trade_audit_log.csv"
         self.open_trade_audit = {}
         self._entry_in_progress = False
+        self.active_symbol = None
+        self.active_qty = 0
+        self.active_entry_price = 0.0
+        self.active_entry_side = None
+        self.active_trade_target = 0.0
+        self.active_trade_stop_loss = 0.0
 
         self.start_capital = 200000.00
         self.capital = 200000.00
@@ -41,6 +42,17 @@ class CodespaceSelfImprovingRobot:
         self.daily_max_loss = 1500.00
         self.trade_target = 2500.00
         self.trade_max_loss = 1000.00
+        self.session_pnl = self._recover_session_pnl()
+        if (
+            self.session_pnl >= self.daily_target
+            or self.session_pnl <= -self.daily_max_loss
+        ):
+            print(f"[DAILY LIMIT REACHED] Session P&L: ₹{self.session_pnl:,.2f}")
+            raise SystemExit(0)
+
+        self.kite = KiteConnect(api_key=self.API_KEY, timeout=20)
+        self._authenticate()
+
         self.log_filename = "performance_log.json"
         self.execution_quantities = {
             "NIFTY": 65,
@@ -82,6 +94,25 @@ class CodespaceSelfImprovingRobot:
         
         # Initialize self-learning loop from yesterday's history
         self.run_self_analysis()
+
+    def _recover_session_pnl(self):
+        if not os.path.exists(self.trade_audit_filename):
+            return 0.0
+
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+        session_pnl = 0.0
+        with open(self.trade_audit_filename, "r", newline="") as audit_file:
+            for row in csv.DictReader(audit_file):
+                timestamp = row.get("timestamp_ist", "")
+                if not timestamp or timestamp[:10] != today:
+                    continue
+                try:
+                    gross_pnl = float(row.get("gross_pnl", ""))
+                except (TypeError, ValueError):
+                    continue
+                if isfinite(gross_pnl):
+                    session_pnl += gross_pnl
+        return session_pnl
 
     def _authenticate(self):
         if self.API_KEY == "YOUR_API_KEY" or not self.API_KEY:
@@ -344,6 +375,13 @@ class CodespaceSelfImprovingRobot:
         )
         bullish = bullish_momentum and five_minute_bullish
         bearish = bearish_momentum and five_minute_bearish
+        trends_aligned = (
+            minute_fast.iloc[-1] > minute_slow.iloc[-1]
+            and five_fast.iloc[-1] > five_slow.iloc[-1]
+        ) or (
+            minute_fast.iloc[-1] < minute_slow.iloc[-1]
+            and five_fast.iloc[-1] < five_slow.iloc[-1]
+        )
 
         if bullish or bearish:
             if (
@@ -361,6 +399,8 @@ class CodespaceSelfImprovingRobot:
                         "rsi": current_rsi,
                         "adx": current_adx,
                         "atr_percent": atr_percent,
+                        "five_minute_adx": five_minute["adx"],
+                        "trends_aligned": trends_aligned,
                     }
                 if bearish and chain["call_writing"] > 0 and chain["resistance"]:
                     return {
@@ -373,6 +413,8 @@ class CodespaceSelfImprovingRobot:
                         "rsi": current_rsi,
                         "adx": current_adx,
                         "atr_percent": atr_percent,
+                        "five_minute_adx": five_minute["adx"],
+                        "trends_aligned": trends_aligned,
                     }
 
             direction = "CE" if bullish else "PE"
@@ -395,6 +437,8 @@ class CodespaceSelfImprovingRobot:
                 "rsi": current_rsi,
                 "adx": current_adx,
                 "atr_percent": atr_percent,
+                "five_minute_adx": five_minute["adx"],
+                "trends_aligned": trends_aligned,
             }
 
         return None
@@ -403,30 +447,23 @@ class CodespaceSelfImprovingRobot:
         matches = chain[option_type]
         return min(matches, key=lambda row: abs(row["strike"] - strike), default=None)
 
-    def _place_option_order(self, index_name, contract, transaction_type):
+    def _place_option_order(
+        self, index_name, contract, transaction_type, quantity=None
+    ):
         config = self.indices[index_name]
         return self._place_order(
             variety=self.kite.VARIETY_REGULAR,
             exchange=config["option_exchange"],
             tradingsymbol=contract["tradingsymbol"],
             transaction_type=transaction_type,
-            quantity=self.execution_quantities[index_name],
+            quantity=quantity or self.execution_quantities[index_name],
             product=self.kite.PRODUCT_MIS,
             order_type=self.kite.ORDER_TYPE_MARKET,
             market_protection=-1,
         )
 
     def _place_order(self, **order_params):
-        symbol = order_params["tradingsymbol"]
-        if self._entry_in_progress and symbol not in self.active_trade_symbols:
-            self.active_trade_pnl_baselines[symbol] = self._get_symbol_daily_pnl(
-                symbol
-            )
-        order_id = self.kite.place_order(tag="ai_bot", **order_params)
-        self.bot_traded_symbols.add(symbol)
-        if self._entry_in_progress:
-            self.active_trade_symbols.add(symbol)
-        return order_id
+        return self.kite.place_order(tag="ai_bot", **order_params)
 
     def _order_details(self, order_id):
         orders = self._kite_read("orders")
@@ -522,6 +559,12 @@ class CodespaceSelfImprovingRobot:
                     "entry_price": fill_price,
                     "quantity": quantity,
                 }
+            self.active_symbol = symbol
+            self.active_qty = quantity
+            self.active_entry_price = fill_price
+            self.active_entry_side = side
+            self.active_trade_target = self.trade_target
+            self.active_trade_stop_loss = self.trade_max_loss
         else:
             entry = self.open_trade_audit.get(symbol) or fallback_entry
             if entry:
@@ -537,6 +580,16 @@ class CodespaceSelfImprovingRobot:
                     self.open_trade_audit[symbol]["quantity"] = remaining
                 else:
                     self.open_trade_audit.pop(symbol, None)
+                if gross_pnl is not None:
+                    self.session_pnl += gross_pnl
+                if symbol == self.active_symbol:
+                    self.active_qty = max(0, self.active_qty - matched_quantity)
+                    if self.active_qty == 0:
+                        self.active_symbol = None
+                        self.active_entry_price = 0.0
+                        self.active_entry_side = None
+                        self.active_trade_target = 0.0
+                        self.active_trade_stop_loss = 0.0
 
         self._write_trade_audit(
             symbol,
@@ -549,9 +602,11 @@ class CodespaceSelfImprovingRobot:
         )
         return quantity
 
-    def _submit_audited_entry(self, index_name, contract, side):
-        quantity = self.execution_quantities[index_name]
-        order_id = self._place_option_order(index_name, contract, side)
+    def _submit_audited_entry(self, index_name, contract, side, quantity=None):
+        quantity = quantity or self.execution_quantities[index_name]
+        order_id = self._place_option_order(
+            index_name, contract, side, quantity=quantity
+        )
         if not self._wait_for_fill(order_id):
             try:
                 self.kite.cancel_order(
@@ -581,10 +636,34 @@ class CodespaceSelfImprovingRobot:
             time.sleep(1)
         return False
 
+    def _execution_profile(self, candidate):
+        name = candidate["index"]
+        high_conviction = (
+            float(candidate["score"]) >= 5.5
+            and float(candidate.get("five_minute_adx", 0.0)) >= 25
+            and candidate.get("trends_aligned", False)
+        )
+        lot_count = 2 if high_conviction else 1
+        quantity = self.execution_quantities[name] * lot_count
+        if high_conviction:
+            target, stop_loss = 3000.0, 1200.0
+            tier = "HIGH_CONVICTION"
+        elif name == "BANKNIFTY":
+            target, stop_loss = 2500.0, 1000.0
+            tier = "STANDARD"
+        else:
+            target, stop_loss = 1500.0, 800.0
+            tier = "STANDARD"
+        return quantity, lot_count, target, stop_loss, tier
+
     def _execute_candidate(self, candidate):
         name = candidate["index"]
         chain = candidate["chain"]
-        quantity = self.execution_quantities[name]
+        quantity, lot_count, target, stop_loss, tier = self._execution_profile(
+            candidate
+        )
+        self.trade_target = target
+        self.trade_max_loss = stop_loss
 
         if candidate["mode"] == "LONG":
             atm = round(candidate["spot"] / self.indices[name]["strike_step"]) * self.indices[name]["strike_step"]
@@ -592,9 +671,13 @@ class CodespaceSelfImprovingRobot:
             if not contract or contract["last_price"] <= 0:
                 return False
             order_id, filled_quantity = self._submit_audited_entry(
-                name, contract, self.kite.TRANSACTION_TYPE_BUY
+                name, contract, self.kite.TRANSACTION_TYPE_BUY, quantity
             )
-            print(f"[ORDER] {name} BUY {contract['tradingsymbol']} x{quantity}; order {order_id}")
+            print(
+                f"[ORDER] {name} BUY {contract['tradingsymbol']} "
+                f"x{filled_quantity}; {lot_count}-lot {tier} "
+                f"(score={candidate['score']:.2f}); order {order_id}"
+            )
             return filled_quantity > 0
 
         if candidate["mode"] == "PUT_CREDIT":
@@ -618,7 +701,7 @@ class CodespaceSelfImprovingRobot:
             return False
 
         protective_order, protective_filled = self._submit_audited_entry(
-            name, long_contract, self.kite.TRANSACTION_TYPE_BUY
+            name, long_contract, self.kite.TRANSACTION_TYPE_BUY, quantity
         )
         if protective_filled < quantity:
             print(f"[SPREAD ABORTED] {name} protective leg was not confirmed filled.")
@@ -643,7 +726,7 @@ class CodespaceSelfImprovingRobot:
 
         try:
             short_order, short_filled = self._submit_audited_entry(
-                name, short_contract, self.kite.TRANSACTION_TYPE_SELL
+                name, short_contract, self.kite.TRANSACTION_TYPE_SELL, quantity
             )
         except Exception:
             self._square_off_mis_positions("PER_TRADE_SL")
@@ -654,6 +737,7 @@ class CodespaceSelfImprovingRobot:
             return False
         print(
             f"[SPREAD] {name} {candidate['mode']} x{quantity}; "
+            f"{lot_count}-lot {tier} (score={candidate['score']:.2f}); "
             f"protective order {protective_order}, short order {short_order}"
         )
         return True
@@ -674,30 +758,40 @@ class CodespaceSelfImprovingRobot:
         )
 
     def _get_daily_pnl(self):
-        if not self.bot_traded_symbols:
-            return 0.0
-
-        positions = self._kite_read("positions")
-        daily_pnl = 0.0
-        for position in positions.get("day", []):
-            if position.get("tradingsymbol") not in self.bot_traded_symbols:
-                continue
-            daily_pnl += self._position_pnl(position)
-        return daily_pnl
+        return self._get_session_pnl()
 
     def _get_session_pnl(self):
-        return self._get_daily_pnl()
+        return self.session_pnl + self._get_active_trade_pnl()
 
     def _get_active_trade_pnl(self):
-        if not self.active_trade_symbols:
+        if not self.active_symbol or self.active_qty <= 0:
             return 0.0
         positions = self._kite_read("positions")
-        return sum(
-            self._position_pnl(position)
-            - self.active_trade_pnl_baselines.get(position.get("tradingsymbol"), 0.0)
-            for position in positions.get("day", [])
-            if position.get("tradingsymbol") in self.active_trade_symbols
+        position = next(
+            (
+                position
+                for position in positions.get("net", [])
+                if position.get("tradingsymbol") == self.active_symbol
+                and position.get("product") == self.kite.PRODUCT_MIS
+                and int(position.get("quantity") or 0) != 0
+            ),
+            None,
         )
+        if not position:
+            return 0.0
+        position_quantity = int(position.get("quantity") or 0)
+        expected_sign = (
+            1 if self.active_entry_side == self.kite.TRANSACTION_TYPE_BUY else -1
+        )
+        if position_quantity * expected_sign <= 0:
+            return 0.0
+
+        quote_key = f"{position['exchange']}:{self.active_symbol}"
+        quote = self._kite_read("ltp", quote_key)[quote_key]
+        price_change = float(quote["last_price"]) - self.active_entry_price
+        if self.active_entry_side == self.kite.TRANSACTION_TYPE_SELL:
+            price_change = -price_change
+        return price_change * min(self.active_qty, abs(position_quantity))
 
     def _get_live_bot_pnl(self):
         positions = self._kite_read("positions")
@@ -706,7 +800,15 @@ class CodespaceSelfImprovingRobot:
             for position in positions.get("net", [])
             if position.get("product") == self.kite.PRODUCT_MIS
             and int(position.get("quantity") or 0) != 0
-            and position.get("tradingsymbol") in self.bot_traded_symbols
+            and position.get("tradingsymbol") == self.active_symbol
+            and self.active_symbol is not None
+            and int(position.get("quantity") or 0)
+            * (
+                1
+                if self.active_entry_side == self.kite.TRANSACTION_TYPE_BUY
+                else -1
+            )
+            > 0
         ]
         quote_keys = {
             f"{position['exchange']}:{position['tradingsymbol']}"
@@ -721,44 +823,27 @@ class CodespaceSelfImprovingRobot:
             )
             for position in open_positions
         }
-        live_pnl_by_symbol = {}
-        for position in open_positions:
-            symbol = position["tradingsymbol"]
-            quote_key = f"{position['exchange']}:{symbol}"
-            live_pnl_by_symbol[symbol] = (
-                live_prices[quote_key] - float(position.get("average_price") or 0.0)
-            ) * int(position["quantity"])
-
-        daily_pnl = 0.0
         trade_pnl = 0.0
-        for position in positions.get("day", []):
-            symbol = position.get("tradingsymbol")
-            if symbol not in self.bot_traded_symbols:
-                continue
-            unrealised = float(position.get("unrealised") or 0.0)
-            realised = position.get("realised")
-            if realised is None:
-                realised = self._position_pnl(position) - unrealised
-            realised = float(realised or 0.0)
-            live_unrealised = live_pnl_by_symbol.get(symbol, 0.0)
-            daily_pnl += realised + live_unrealised
-            if symbol in self.active_trade_symbols:
-                trade_pnl += (
-                    realised
-                    - self.active_trade_pnl_baselines.get(symbol, 0.0)
-                    + live_unrealised
-                )
-        return open_positions, live_prices, daily_pnl, trade_pnl
+        if open_positions and self.active_qty > 0:
+            quote_key = f"{open_positions[0]['exchange']}:{self.active_symbol}"
+            price_change = live_prices[quote_key] - self.active_entry_price
+            if self.active_entry_side == self.kite.TRANSACTION_TYPE_SELL:
+                price_change = -price_change
+            trade_pnl = price_change * min(
+                self.active_qty, abs(int(open_positions[0].get("quantity") or 0))
+            )
+        return open_positions, live_prices, self.session_pnl + trade_pnl, trade_pnl
 
     def _get_open_bot_positions(self):
-        if not self.bot_traded_symbols:
+        if not self.active_symbol or self.active_qty <= 0:
             return []
         positions = self._kite_read("positions")
         return [
             position
             for position in positions.get("net", [])
             if int(position.get("quantity") or 0) != 0
-            and position.get("tradingsymbol") in self.bot_traded_symbols
+            and position.get("product") == self.kite.PRODUCT_MIS
+            and position.get("tradingsymbol") == self.active_symbol
         ]
 
     def _manage_active_trade(self, ist=None):
@@ -785,8 +870,12 @@ class CodespaceSelfImprovingRobot:
                 time.sleep(2)
                 continue
             if not open_positions:
-                self.active_trade_symbols.clear()
-                self.active_trade_pnl_baselines.clear()
+                self.active_symbol = None
+                self.active_qty = 0
+                self.active_entry_price = 0.0
+                self.active_entry_side = None
+                self.active_trade_target = 0.0
+                self.active_trade_stop_loss = 0.0
                 return monitored
 
             monitored = True
@@ -794,14 +883,14 @@ class CodespaceSelfImprovingRobot:
                 f"[ACTIVE TRADE] P&L: ₹{trade_pnl:,.2f} | "
                 f"Session P&L: ₹{daily_pnl:,.2f}"
             )
-            if daily_pnl >= self.daily_target:
+            if trade_pnl <= -self.active_trade_stop_loss:
+                reason = "PER_TRADE_SL"
+            elif trade_pnl >= self.active_trade_target:
+                reason = "PER_TRADE_TARGET"
+            elif daily_pnl >= self.daily_target:
                 reason = "DAILY_TARGET"
             elif daily_pnl <= -self.daily_max_loss:
                 reason = "DAILY_SL"
-            elif trade_pnl >= self.trade_target:
-                reason = "PER_TRADE_TARGET"
-            elif trade_pnl <= -self.trade_max_loss:
-                reason = "PER_TRADE_SL"
             else:
                 reason = None
 
@@ -822,8 +911,8 @@ class CodespaceSelfImprovingRobot:
         self, exit_reason="EOD_SQUARE_OFF", live_prices=None
     ):
         live_prices = live_prices or {}
-        if not self.bot_traded_symbols:
-            print("[SQUARE-OFF] No bot-traded symbols to close.")
+        if not self.active_symbol or self.active_qty <= 0:
+            print("[SQUARE-OFF] No active bot position to close.")
             return
 
         positions = self._kite_read("positions")
@@ -832,7 +921,7 @@ class CodespaceSelfImprovingRobot:
             for position in positions.get("net", [])
             if position.get("product") == self.kite.PRODUCT_MIS
             and int(position.get("quantity") or 0) != 0
-            and position.get("tradingsymbol") in self.bot_traded_symbols
+            and position.get("tradingsymbol") == self.active_symbol
         ]
         if not open_positions:
             print("[SQUARE-OFF] No open MIS net positions.")
@@ -840,10 +929,21 @@ class CodespaceSelfImprovingRobot:
 
         failures = []
         for position in open_positions:
-            quantity = int(position["quantity"])
+            position_quantity = int(position["quantity"])
+            expected_sign = (
+                1
+                if self.active_entry_side == self.kite.TRANSACTION_TYPE_BUY
+                else -1
+            )
+            if position_quantity * expected_sign <= 0:
+                failures.append(
+                    f"{self.active_symbol}: net position does not match the active entry side"
+                )
+                continue
+            quantity = min(self.active_qty, abs(position_quantity))
             transaction_type = (
                 self.kite.TRANSACTION_TYPE_SELL
-                if quantity > 0
+                if position_quantity > 0
                 else self.kite.TRANSACTION_TYPE_BUY
             )
             try:
