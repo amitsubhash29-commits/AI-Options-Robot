@@ -37,6 +37,10 @@ class CodespaceSelfImprovingRobot:
         self.active_trade_target_pct = 0.0
         self.active_trade_stop_loss_pct = 0.0
         self.active_trade_peak_pct = 0.0
+        self.post_exit_cooldown_seconds = 180
+        self.post_exit_cooldown_until = 0.0
+        self.minimum_daily_loss_buffer = 1500.0
+        self.confirmation_counts = {}
 
         self.start_capital = 200000.00
         self.capital = 200000.00
@@ -385,6 +389,9 @@ class CodespaceSelfImprovingRobot:
             and five_fast.iloc[-1] < five_slow.iloc[-1]
         )
 
+        if not (five_minute["adx"] >= 25.0 and current_rsi <= 62.0):
+            return None
+
         if bullish or bearish:
             if (
                 five_minute["adx"] < 18
@@ -625,12 +632,7 @@ class CodespaceSelfImprovingRobot:
                 if symbol == self.active_symbol:
                     self.active_qty = max(0, self.active_qty - matched_quantity)
                     if self.active_qty == 0:
-                        self.active_symbol = None
-                        self.active_entry_price = 0.0
-                        self.active_entry_side = None
-                        self.active_trade_target_pct = 0.0
-                        self.active_trade_stop_loss_pct = 0.0
-                        self.active_trade_peak_pct = 0.0
+                        self._reset_after_active_exit(symbol)
 
         self._write_trade_audit(
             symbol,
@@ -644,8 +646,50 @@ class CodespaceSelfImprovingRobot:
         )
         return quantity
 
-    def _submit_audited_entry(self, index_name, contract, side, quantity=None):
+    def _reset_after_active_exit(self, symbol=None):
+        if symbol:
+            self.open_trade_audit.pop(symbol, None)
+        self.confirmation_counts.clear()
+        self.post_exit_cooldown_until = (
+            time.monotonic() + self.post_exit_cooldown_seconds
+        )
+        self.active_symbol = None
+        self.active_qty = 0
+        self.active_entry_price = 0.0
+        self.active_entry_side = None
+        self.active_trade_target_pct = 0.0
+        self.active_trade_stop_loss_pct = 0.0
+        self.active_trade_peak_pct = 0.0
+        print("[POST-EXIT] Confirmations reset; 180-second entry cooldown started.")
+
+    def _entry_is_allowed(self, candidate):
+        if not (
+            float(candidate.get("five_minute_adx", 0.0)) >= 25.0
+            and float(candidate.get("rsi", float("inf"))) <= 62.0
+        ):
+            print("[SKIP] Hard trend filter failed (5m ADX >= 25 and 1m RSI <= 62 required).")
+            return False
+
+        cooldown_remaining = self.post_exit_cooldown_until - time.monotonic()
+        if cooldown_remaining > 0:
+            print(
+                f"[SKIP] Post-exit cooldown active ({cooldown_remaining:.0f}s remaining)."
+            )
+            return False
+
+        daily_pnl = self._get_session_pnl()
+        remaining_loss_room = daily_pnl + self.daily_max_loss
+        if remaining_loss_room < self.minimum_daily_loss_buffer:
+            print("[SKIP] Insufficient daily risk buffer remaining")
+            return False
+        return True
+
+    def _submit_audited_entry(
+        self, index_name, contract, side, candidate, quantity=None
+    ):
         quantity = quantity or self.execution_quantities[index_name]
+        if not self._entry_is_allowed(candidate):
+            return None, 0
         order_id = self._place_option_order(
             index_name, contract, side, quantity=quantity
         )
@@ -688,7 +732,7 @@ class CodespaceSelfImprovingRobot:
         lot_count = 2 if high_conviction else 1
         quantity = self.execution_quantities[name] * lot_count
         if high_conviction:
-            target, stop_loss = 14.0, 7.0
+            target, stop_loss = 14.0, 5.5
             tier = "HIGH_CONVICTION"
         else:
             target, stop_loss = 16.0, 8.0
@@ -696,6 +740,8 @@ class CodespaceSelfImprovingRobot:
         return quantity, lot_count, target, stop_loss, tier
 
     def _execute_candidate(self, candidate):
+        if not self._entry_is_allowed(candidate):
+            return False
         name = candidate["index"]
         chain = candidate["chain"]
         quantity, lot_count, target, stop_loss, tier = self._execution_profile(
@@ -710,7 +756,7 @@ class CodespaceSelfImprovingRobot:
             if not contract or contract["last_price"] <= 0:
                 return False
             order_id, filled_quantity = self._submit_audited_entry(
-                name, contract, self.kite.TRANSACTION_TYPE_BUY, quantity
+                name, contract, self.kite.TRANSACTION_TYPE_BUY, candidate, quantity
             )
             print(
                 f"[ORDER] {name} BUY {contract['tradingsymbol']} "
@@ -740,7 +786,7 @@ class CodespaceSelfImprovingRobot:
             return False
 
         protective_order, protective_filled = self._submit_audited_entry(
-            name, long_contract, self.kite.TRANSACTION_TYPE_BUY, quantity
+            name, long_contract, self.kite.TRANSACTION_TYPE_BUY, candidate, quantity
         )
         if protective_filled < quantity:
             print(f"[SPREAD ABORTED] {name} protective leg was not confirmed filled.")
@@ -765,7 +811,7 @@ class CodespaceSelfImprovingRobot:
 
         try:
             short_order, short_filled = self._submit_audited_entry(
-                name, short_contract, self.kite.TRANSACTION_TYPE_SELL, quantity
+                name, short_contract, self.kite.TRANSACTION_TYPE_SELL, candidate, quantity
             )
         except Exception:
             self._square_off_mis_positions("PER_TRADE_SL")
@@ -909,13 +955,8 @@ class CodespaceSelfImprovingRobot:
                 time.sleep(2)
                 continue
             if not open_positions:
-                self.active_symbol = None
-                self.active_qty = 0
-                self.active_entry_price = 0.0
-                self.active_entry_side = None
-                self.active_trade_target_pct = 0.0
-                self.active_trade_stop_loss_pct = 0.0
-                self.active_trade_peak_pct = 0.0
+                if self.active_symbol is not None:
+                    self._reset_after_active_exit(self.active_symbol)
                 return monitored
 
             monitored = True
@@ -1148,7 +1189,6 @@ class CodespaceSelfImprovingRobot:
             self._square_off_if_due(ist)
             return
 
-        confirmation_counts = {}
         cycle = 0
         instruments_loaded = False
 
@@ -1207,8 +1247,9 @@ class CodespaceSelfImprovingRobot:
                 (candidate["index"], candidate["mode"], candidate.get("option_type"))
                 for candidate in candidates
             }
-            confirmation_counts = {
-                key: confirmation_counts.get(key, 0) + 1 for key in setup_keys
+            self.confirmation_counts = {
+                key: self.confirmation_counts.get(key, 0) + 1
+                for key in setup_keys
             }
             candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
             for candidate in candidates:
@@ -1220,7 +1261,7 @@ class CodespaceSelfImprovingRobot:
                 print(
                     f"[SETUP] {candidate['index']} {candidate['mode']} "
                     f"score={candidate['score']:.2f} "
-                    f"confirmations={confirmation_counts[setup_key]}/3 "
+                    f"confirmations={self.confirmation_counts[setup_key]}/3 "
                     f"RSI={candidate['rsi']:.1f} ADX={candidate['adx']:.1f} "
                     f"ATR%={candidate['atr_percent']:.3%}"
                 )
@@ -1239,7 +1280,7 @@ class CodespaceSelfImprovingRobot:
                 eligible_candidates = [
                     candidate
                     for candidate in candidates
-                    if confirmation_counts[
+                    if self.confirmation_counts[
                         (
                             candidate["index"],
                             candidate["mode"],
