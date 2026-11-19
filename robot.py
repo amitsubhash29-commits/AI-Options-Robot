@@ -1,5 +1,6 @@
 import os
 import csv
+import tempfile
 from pathlib import Path
 from math import isfinite, log1p
 from dotenv import load_dotenv
@@ -33,15 +34,16 @@ class CodespaceSelfImprovingRobot:
         self.active_qty = 0
         self.active_entry_price = 0.0
         self.active_entry_side = None
-        self.active_trade_target = 0.0
-        self.active_trade_stop_loss = 0.0
+        self.active_trade_target_pct = 0.0
+        self.active_trade_stop_loss_pct = 0.0
+        self.active_trade_peak_pct = 0.0
 
         self.start_capital = 200000.00
         self.capital = 200000.00
-        self.daily_target = 5000.00
-        self.daily_max_loss = 1500.00
-        self.trade_target = 2500.00
-        self.trade_max_loss = 1000.00
+        self.daily_target = 6000.00
+        self.daily_max_loss = 3500.00
+        self.trade_target_pct = 16.0
+        self.trade_stop_loss_pct = 8.0
         self.session_pnl = self._recover_session_pnl()
         if (
             self.session_pnl >= self.daily_target
@@ -481,28 +483,59 @@ class CodespaceSelfImprovingRobot:
         fill_price,
         exit_reason="",
         gross_pnl=None,
+        pct_return=None,
     ):
         slippage_points = (
             fill_price - trigger_price
             if side == self.kite.TRANSACTION_TYPE_BUY
             else trigger_price - fill_price
         )
+        fieldnames = [
+            "timestamp_ist",
+            "symbol",
+            "side",
+            "qty",
+            "trigger_signal_price",
+            "average_fill_price",
+            "slippage_points",
+            "slippage_rupees",
+            "exit_reason",
+            "gross_pnl",
+            "pct_return",
+        ]
         file_exists = os.path.exists(self.trade_audit_filename)
+        if file_exists and os.path.getsize(self.trade_audit_filename) > 0:
+            with open(self.trade_audit_filename, "r", newline="") as audit_file:
+                reader = csv.DictReader(audit_file)
+                if "pct_return" not in (reader.fieldnames or []):
+                    temp_name = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            "w",
+                            newline="",
+                            dir=Path(self.trade_audit_filename).parent,
+                            delete=False,
+                        ) as temp_file:
+                            temp_name = temp_file.name
+                            writer = csv.DictWriter(
+                                temp_file, fieldnames=fieldnames
+                            )
+                            writer.writeheader()
+                            for row in reader:
+                                writer.writerow(
+                                    {
+                                        field: row.get(field, "")
+                                        for field in fieldnames
+                                    }
+                                )
+                        os.replace(temp_name, self.trade_audit_filename)
+                    finally:
+                        if temp_name and os.path.exists(temp_name):
+                            os.unlink(temp_name)
         with open(self.trade_audit_filename, "a", newline="") as audit_file:
             writer = csv.DictWriter(
                 audit_file,
-                fieldnames=[
-                    "timestamp_ist",
-                    "symbol",
-                    "side",
-                    "qty",
-                    "trigger_signal_price",
-                    "average_fill_price",
-                    "slippage_points",
-                    "slippage_rupees",
-                    "exit_reason",
-                    "gross_pnl",
-                ],
+                fieldnames=fieldnames,
             )
             if not file_exists or os.path.getsize(self.trade_audit_filename) == 0:
                 writer.writeheader()
@@ -520,6 +553,7 @@ class CodespaceSelfImprovingRobot:
                     "slippage_rupees": f"{slippage_points * quantity:.2f}",
                     "exit_reason": exit_reason,
                     "gross_pnl": "" if gross_pnl is None else f"{gross_pnl:.2f}",
+                    "pct_return": "" if pct_return is None else f"{pct_return:+.2f}",
                 }
             )
 
@@ -544,6 +578,7 @@ class CodespaceSelfImprovingRobot:
 
         quantity = min(filled_quantity, requested_quantity)
         gross_pnl = None
+        pct_return = None
         if is_entry:
             previous = self.open_trade_audit.get(symbol)
             if previous:
@@ -559,12 +594,15 @@ class CodespaceSelfImprovingRobot:
                     "entry_price": fill_price,
                     "quantity": quantity,
                 }
+            if symbol != self.active_symbol:
+                self.active_trade_peak_pct = 0.0
             self.active_symbol = symbol
-            self.active_qty = quantity
-            self.active_entry_price = fill_price
-            self.active_entry_side = side
-            self.active_trade_target = self.trade_target
-            self.active_trade_stop_loss = self.trade_max_loss
+            active_entry = self.open_trade_audit[symbol]
+            self.active_qty = active_entry["quantity"]
+            self.active_entry_price = active_entry["entry_price"]
+            self.active_entry_side = active_entry["side"]
+            self.active_trade_target_pct = self.trade_target_pct
+            self.active_trade_stop_loss_pct = self.trade_stop_loss_pct
         else:
             entry = self.open_trade_audit.get(symbol) or fallback_entry
             if entry:
@@ -575,6 +613,8 @@ class CodespaceSelfImprovingRobot:
                     else entry["entry_price"] - fill_price
                 )
                 gross_pnl = price_change * matched_quantity
+                if entry["entry_price"] > 0:
+                    pct_return = price_change / entry["entry_price"] * 100
                 remaining = entry["quantity"] - matched_quantity
                 if remaining > 0 and symbol in self.open_trade_audit:
                     self.open_trade_audit[symbol]["quantity"] = remaining
@@ -588,8 +628,9 @@ class CodespaceSelfImprovingRobot:
                         self.active_symbol = None
                         self.active_entry_price = 0.0
                         self.active_entry_side = None
-                        self.active_trade_target = 0.0
-                        self.active_trade_stop_loss = 0.0
+                        self.active_trade_target_pct = 0.0
+                        self.active_trade_stop_loss_pct = 0.0
+                        self.active_trade_peak_pct = 0.0
 
         self._write_trade_audit(
             symbol,
@@ -599,6 +640,7 @@ class CodespaceSelfImprovingRobot:
             fill_price,
             exit_reason=exit_reason,
             gross_pnl=gross_pnl,
+            pct_return=pct_return,
         )
         return quantity
 
@@ -646,13 +688,10 @@ class CodespaceSelfImprovingRobot:
         lot_count = 2 if high_conviction else 1
         quantity = self.execution_quantities[name] * lot_count
         if high_conviction:
-            target, stop_loss = 3000.0, 1200.0
+            target, stop_loss = 14.0, 7.0
             tier = "HIGH_CONVICTION"
-        elif name == "BANKNIFTY":
-            target, stop_loss = 2500.0, 1000.0
-            tier = "STANDARD"
         else:
-            target, stop_loss = 1500.0, 800.0
+            target, stop_loss = 16.0, 8.0
             tier = "STANDARD"
         return quantity, lot_count, target, stop_loss, tier
 
@@ -662,8 +701,8 @@ class CodespaceSelfImprovingRobot:
         quantity, lot_count, target, stop_loss, tier = self._execution_profile(
             candidate
         )
-        self.trade_target = target
-        self.trade_max_loss = stop_loss
+        self.trade_target_pct = target
+        self.trade_stop_loss_pct = stop_loss
 
         if candidate["mode"] == "LONG":
             atm = round(candidate["spot"] / self.indices[name]["strike_step"]) * self.indices[name]["strike_step"]
@@ -874,18 +913,37 @@ class CodespaceSelfImprovingRobot:
                 self.active_qty = 0
                 self.active_entry_price = 0.0
                 self.active_entry_side = None
-                self.active_trade_target = 0.0
-                self.active_trade_stop_loss = 0.0
+                self.active_trade_target_pct = 0.0
+                self.active_trade_stop_loss_pct = 0.0
+                self.active_trade_peak_pct = 0.0
                 return monitored
 
             monitored = True
+            quote_key = (
+                f"{open_positions[0]['exchange']}:{self.active_symbol}"
+            )
+            current_ltp = live_prices[quote_key]
+            price_change = current_ltp - self.active_entry_price
+            if self.active_entry_side == self.kite.TRANSACTION_TYPE_SELL:
+                price_change = -price_change
+            pct_change = price_change / self.active_entry_price * 100
+            self.active_trade_peak_pct = max(
+                self.active_trade_peak_pct, pct_change
+            )
+            profit_lock_active = self.active_trade_peak_pct >= 10.0
+            active_stop_floor = (
+                2.0
+                if profit_lock_active
+                else -self.active_trade_stop_loss_pct
+            )
             print(
-                f"[ACTIVE TRADE] P&L: ₹{trade_pnl:,.2f} | "
+                f"[ACTIVE TRADE] {pct_change:+.1f}% / ₹{trade_pnl:+,.2f} | "
+                f"SL Floor: {active_stop_floor:+.1f}% | "
                 f"Session P&L: ₹{daily_pnl:,.2f}"
             )
-            if trade_pnl <= -self.active_trade_stop_loss:
-                reason = "PER_TRADE_SL"
-            elif trade_pnl >= self.active_trade_target:
+            if pct_change <= active_stop_floor:
+                reason = "PROFIT_LOCK_SL" if profit_lock_active else "PER_TRADE_SL"
+            elif pct_change >= self.active_trade_target_pct:
                 reason = "PER_TRADE_TARGET"
             elif daily_pnl >= self.daily_target:
                 reason = "DAILY_TARGET"
