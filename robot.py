@@ -2,7 +2,7 @@ import os
 import csv
 import tempfile
 from pathlib import Path
-from math import isfinite, log1p
+from math import isfinite
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(".") / ".env")
@@ -39,7 +39,7 @@ class CodespaceSelfImprovingRobot:
         self.active_trade_peak_pct = 0.0
         self.post_exit_cooldown_seconds = 180
         self.post_exit_cooldown_until = 0.0
-        self.minimum_daily_loss_buffer = 1500.0
+        self.minimum_daily_loss_buffer = 950.0
         self.confirmation_counts = {}
 
         self.start_capital = 200000.00
@@ -93,10 +93,6 @@ class CodespaceSelfImprovingRobot:
         self.oi_snapshots = {name: {} for name in self.indices}
         self.candle_cache = {name: {} for name in self.indices}
         self.last_order_candle = {}
-        
-        # Adjustable trading filters
-        self.rsi_overbought = 70.0
-        self.rsi_oversold = 30.0
         
         # Initialize self-learning loop from yesterday's history
         self.run_self_analysis()
@@ -286,6 +282,7 @@ class CodespaceSelfImprovingRobot:
         close = frame["close"].astype(float)
         fast_ema = EMAIndicator(close, window=9).ema_indicator()
         slow_ema = EMAIndicator(close, window=21).ema_indicator()
+        ema_20 = EMAIndicator(close, window=20).ema_indicator()
         trend_ema = EMAIndicator(close, window=50).ema_indicator()
         rsi = RSIIndicator(close, window=14).rsi()
         adx = ADXIndicator(
@@ -299,6 +296,7 @@ class CodespaceSelfImprovingRobot:
             "close": close,
             "fast_ema": fast_ema,
             "slow_ema": slow_ema,
+            "ema_20": ema_20,
             "trend_ema": trend_ema,
             "bullish_cross": (
                 fast_ema.iloc[-2] <= slow_ema.iloc[-2]
@@ -331,12 +329,7 @@ class CodespaceSelfImprovingRobot:
             )
             return None
 
-        minute_fast = minute["fast_ema"]
-        minute_slow = minute["slow_ema"]
-        five_fast = five_minute["fast_ema"]
-        five_slow = five_minute["slow_ema"]
         current_rsi = minute["rsi"]
-        current_adx = minute["adx"]
         atr_percent = minute["atr_percent"]
         quote_key = f"{config['spot_exchange']}:{config['spot_symbol']}"
         spot_price = float(self._kite_read("ltp", quote_key)[quote_key]["last_price"])
@@ -349,108 +342,52 @@ class CodespaceSelfImprovingRobot:
             f"EMA-cross 1m={'up' if minute['bullish_cross'] else 'down' if minute['bearish_cross'] else 'none'} "
             f"5m={'up' if five_minute['bullish_cross'] else 'down' if five_minute['bearish_cross'] else 'none'}"
         )
+        five_minute_close = five_minute["last_close"]
+        five_minute_ema20 = float(five_minute["ema_20"].iloc[-1])
+        minute_ema9 = float(minute["fast_ema"].iloc[-1])
+        if not (
+            five_minute_close > five_minute_ema20
+            and five_minute["adx"] >= 25.0
+            and 45.0 <= current_rsi <= 56.0
+            and minute["last_close"] > minute_ema9
+        ):
+            return None
+
         chain = self._get_option_chain(name, spot_price)
         if chain is None:
             return None
 
-        bullish_momentum = (
-            minute_fast.iloc[-1] > minute_slow.iloc[-1]
-            and minute["last_close"] > minute["trend_ema"].iloc[-1]
-            and (
-                minute["bullish_cross"]
-                or current_rsi >= 60
-                or current_rsi >= self.rsi_overbought
+        writing = chain["put_writing"]
+        oi_confirmation = 1.0 if writing > 0 else 0.0
+        strength = min(
+            abs(
+                float(
+                    minute["fast_ema"].iloc[-1]
+                    - minute["slow_ema"].iloc[-1]
+                )
             )
+            / max(minute["atr"], 1.0),
+            2.0,
         )
-        bearish_momentum = (
-            minute_fast.iloc[-1] < minute_slow.iloc[-1]
-            and minute["last_close"] < minute["trend_ema"].iloc[-1]
-            and (
-                minute["bearish_cross"]
-                or current_rsi <= 40
-                or current_rsi <= self.rsi_oversold
-            )
-        )
-        five_minute_bullish = (
-            five_fast.iloc[-1] > five_slow.iloc[-1]
-            and five_minute["last_close"] > five_minute["trend_ema"].iloc[-1]
-        )
-        five_minute_bearish = (
-            five_fast.iloc[-1] < five_slow.iloc[-1]
-            and five_minute["last_close"] < five_minute["trend_ema"].iloc[-1]
-        )
-        bullish = bullish_momentum and five_minute_bullish
-        bearish = bearish_momentum and five_minute_bearish
-        trends_aligned = (
-            minute_fast.iloc[-1] > minute_slow.iloc[-1]
-            and five_fast.iloc[-1] > five_slow.iloc[-1]
-        ) or (
-            minute_fast.iloc[-1] < minute_slow.iloc[-1]
-            and five_fast.iloc[-1] < five_slow.iloc[-1]
-        )
-
-        if not (five_minute["adx"] >= 25.0 and current_rsi <= 62.0):
-            return None
-
-        if bullish or bearish:
-            if (
-                five_minute["adx"] < 18
-                and five_minute["atr_percent"] < 0.004
-            ):
-                if bullish and chain["put_writing"] > 0 and chain["support"]:
-                    return {
-                        "index": name,
-                        "mode": "PUT_CREDIT",
-                        "score": 2.0 + log1p(chain["put_writing"]),
-                        "spot": spot_price,
-                        "chain": chain,
-                        "candle": minute_candles[-1]["date"],
-                        "rsi": current_rsi,
-                        "adx": current_adx,
-                        "atr_percent": atr_percent,
-                        "five_minute_adx": five_minute["adx"],
-                        "trends_aligned": trends_aligned,
-                    }
-                if bearish and chain["call_writing"] > 0 and chain["resistance"]:
-                    return {
-                        "index": name,
-                        "mode": "CALL_CREDIT",
-                        "score": 2.0 + log1p(chain["call_writing"]),
-                        "spot": spot_price,
-                        "chain": chain,
-                        "candle": minute_candles[-1]["date"],
-                        "rsi": current_rsi,
-                        "adx": current_adx,
-                        "atr_percent": atr_percent,
-                        "five_minute_adx": five_minute["adx"],
-                        "trends_aligned": trends_aligned,
-                    }
-
-            direction = "CE" if bullish else "PE"
-            writing = chain["put_writing"] if bullish else chain["call_writing"]
-            oi_confirmation = 1.0 if writing > 0 else 0.0
-            strength = min(
-                abs(float(minute_fast.iloc[-1] - minute_slow.iloc[-1]))
-                / max(minute["atr"], 1.0),
-                2.0,
-            )
-            momentum = min(abs(current_rsi - 50.0) / 20.0, 1.5)
-            return {
-                "index": name,
-                "mode": "LONG",
-                "option_type": direction,
-                "score": 3.0 + strength + momentum + oi_confirmation,
-                "spot": spot_price,
-                "chain": chain,
-                "candle": minute_candles[-1]["date"],
-                "rsi": current_rsi,
-                "adx": current_adx,
-                "atr_percent": atr_percent,
-                "five_minute_adx": five_minute["adx"],
-                "trends_aligned": trends_aligned,
-            }
-
-        return None
+        momentum = min(abs(current_rsi - 50.0) / 20.0, 1.5)
+        return {
+            "index": name,
+            "mode": "LONG",
+            "option_type": "CE",
+            "score": 3.0 + strength + momentum + oi_confirmation,
+            "spot": spot_price,
+            "chain": chain,
+            "candle": minute_candles[-1]["date"],
+            "rsi": current_rsi,
+            "adx": minute["adx"],
+            "atr_percent": atr_percent,
+            "five_minute_adx": five_minute["adx"],
+            "five_minute_close": five_minute_close,
+            "five_minute_ema20": five_minute_ema20,
+            "minute_close": minute["last_close"],
+            "minute_ema9": minute_ema9,
+            "trends_aligned": True,
+        }
 
     def _find_contract(self, chain, option_type, strike):
         matches = chain[option_type]
@@ -665,9 +602,24 @@ class CodespaceSelfImprovingRobot:
     def _entry_is_allowed(self, candidate):
         if not (
             float(candidate.get("five_minute_adx", 0.0)) >= 25.0
-            and float(candidate.get("rsi", float("inf"))) <= 62.0
+            and float(candidate.get("five_minute_close", 0.0))
+            > float(candidate.get("five_minute_ema20", float("inf")))
+            and 45.0 <= float(candidate.get("rsi", float("inf"))) <= 56.0
+            and float(candidate.get("minute_close", 0.0))
+            > float(candidate.get("minute_ema9", float("inf")))
         ):
-            print("[SKIP] Hard trend filter failed (5m ADX >= 25 and 1m RSI <= 62 required).")
+            print(
+                "[SKIP] Trend-pullback filter failed "
+                "(5m close > EMA20, 5m ADX >= 25, "
+                "1m RSI 45-56, and 1m close > EMA9 required)."
+            )
+            return False
+
+        now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+        midday_start = now_ist.replace(hour=11, minute=30, second=0, microsecond=0)
+        midday_end = now_ist.replace(hour=13, minute=15, second=0, microsecond=0)
+        if midday_start <= now_ist < midday_end:
+            print("[SKIP] New entries are blocked during the 11:30-13:15 IST chop window.")
             return False
 
         cooldown_remaining = self.post_exit_cooldown_until - time.monotonic()
@@ -725,18 +677,20 @@ class CodespaceSelfImprovingRobot:
     def _execution_profile(self, candidate):
         name = candidate["index"]
         high_conviction = (
-            float(candidate["score"]) >= 5.5
-            and float(candidate.get("five_minute_adx", 0.0)) >= 25
-            and candidate.get("trends_aligned", False)
+            float(candidate["score"]) >= 6.0
+            and float(candidate.get("five_minute_adx", 0.0)) >= 32.0
         )
         lot_count = 2 if high_conviction else 1
         quantity = self.execution_quantities[name] * lot_count
-        if high_conviction:
-            target, stop_loss = 14.0, 5.5
-            tier = "HIGH_CONVICTION"
-        else:
-            target, stop_loss = 16.0, 8.0
-            tier = "STANDARD"
+        risk_profiles = {
+            "NIFTY": {"standard": (18.0, 9.0), "high": (15.0, 7.0)},
+            "BANKNIFTY": {"standard": (20.0, 10.0), "high": (16.0, 7.5)},
+            "SENSEX": {"standard": (22.0, 12.0), "high": (18.0, 8.5)},
+        }
+        target, stop_loss = risk_profiles[name][
+            "high" if high_conviction else "standard"
+        ]
+        tier = "HIGH_CONVICTION" if high_conviction else "STANDARD"
         return quantity, lot_count, target, stop_loss, tier
 
     def _execute_candidate(self, candidate):
@@ -971,19 +925,22 @@ class CodespaceSelfImprovingRobot:
             self.active_trade_peak_pct = max(
                 self.active_trade_peak_pct, pct_change
             )
-            profit_lock_active = self.active_trade_peak_pct >= 10.0
-            active_stop_floor = (
-                2.0
-                if profit_lock_active
-                else -self.active_trade_stop_loss_pct
-            )
+            if self.active_trade_peak_pct >= 13.0:
+                active_stop_floor = 7.0
+                profit_lock_reason = "PROFIT_LOCK_TRAIL"
+            elif self.active_trade_peak_pct >= 8.0:
+                active_stop_floor = 1.5
+                profit_lock_reason = "PROFIT_LOCK_BE"
+            else:
+                active_stop_floor = -self.active_trade_stop_loss_pct
+                profit_lock_reason = None
             print(
                 f"[ACTIVE TRADE] {pct_change:+.1f}% / ₹{trade_pnl:+,.2f} | "
                 f"SL Floor: {active_stop_floor:+.1f}% | "
                 f"Session P&L: ₹{daily_pnl:,.2f}"
             )
             if pct_change <= active_stop_floor:
-                reason = "PROFIT_LOCK_SL" if profit_lock_active else "PER_TRADE_SL"
+                reason = profit_lock_reason or "PER_TRADE_SL"
             elif pct_change >= self.active_trade_target_pct:
                 reason = "PER_TRADE_TARGET"
             elif daily_pnl >= self.daily_target:
@@ -1149,10 +1106,7 @@ class CodespaceSelfImprovingRobot:
                 
             recent_losses = len([t for t in logs[-10:] if t['pnl'] < 0])
             if recent_losses > 3:
-                print("⚠️ System Warning: Recent loss cluster detected. Adjusting entry parameters.")
-                self.rsi_overbought += 3.0
-                self.rsi_oversold -= 3.0
-                print(f"🔧 Triggers tightened dynamically to: {self.rsi_oversold} / {self.rsi_overbought}")
+                print("⚠️ System Warning: Recent loss cluster detected.")
         except Exception as e:
             print(f"🔄 Memory load reset: {e}")
 
@@ -1231,6 +1185,20 @@ class CodespaceSelfImprovingRobot:
                     time.sleep(poll_interval)
                 continue
 
+            scan_time = datetime.now(ist)
+            midday_start = scan_time.replace(
+                hour=11, minute=30, second=0, microsecond=0
+            )
+            midday_end = scan_time.replace(
+                hour=13, minute=15, second=0, microsecond=0
+            )
+            if midday_start <= scan_time < midday_end:
+                self.confirmation_counts.clear()
+                print("[MIDDAY CHOP] No new entries from 11:30 to 13:15 IST.")
+                if cycles is None or cycle < cycles:
+                    time.sleep(poll_interval)
+                continue
+
             candidates = []
             for name in self.indices:
                 try:
@@ -1261,7 +1229,7 @@ class CodespaceSelfImprovingRobot:
                 print(
                     f"[SETUP] {candidate['index']} {candidate['mode']} "
                     f"score={candidate['score']:.2f} "
-                    f"confirmations={self.confirmation_counts[setup_key]}/3 "
+                    f"confirmations={self.confirmation_counts[setup_key]}/2 "
                     f"RSI={candidate['rsi']:.1f} ADX={candidate['adx']:.1f} "
                     f"ATR%={candidate['atr_percent']:.3%}"
                 )
@@ -1287,11 +1255,11 @@ class CodespaceSelfImprovingRobot:
                             candidate.get("option_type"),
                         )
                     ]
-                    >= 3
+                    >= 2
                 ]
             if not eligible_candidates and scan_time >= warmup_end:
                 if candidates:
-                    print("Waiting for three consecutive confirmations.")
+                    print("Waiting for two consecutive confirmations.")
                 else:
                     print("No qualified multi-index setup this cycle.")
 
